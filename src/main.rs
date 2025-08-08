@@ -1,240 +1,287 @@
-/// A simple example demonstrating how to handle user input.
+/// A Ratatui example that demonstrates how to use the inlined viewport.
 ///
-/// This is a bit out of the scope of
-/// the library as it does not provide any input handling out of the box. However, it may helps
-/// some to get started.
-///
-/// This is a very simple example:
-///   * An input box always focused. Every character you type is registered here.
-///   * An entered character is inserted at the cursor position.
-///   * Pressing Backspace erases the left character before the cursor position
-///   * Pressing Enter pushes the current input in the history of previous messages.
-///
-/// **Note:** as this is a relatively simple example unicode characters are unsupported and
-/// their use will result in undefined behaviour.
-///
-/// See also <https://github.com/rhysd/tui-textarea> and <https://github.com/sayanarijit/tui-input>/
+/// It shows a list of downloads in progress, with a progress bar for each download.
 ///
 /// This example runs with the Ratatui library code in the branch that you are currently
 /// reading. See the [`latest`] branch for the code which works with the most recent Ratatui
 /// release.
 ///
 /// [`latest`]: https://github.com/ratatui/ratatui/tree/latest
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
 use color_eyre::Result;
-use crossterm::event::{self, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::ExecutableCommand;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout, Position};
-use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, List, ListItem, Paragraph};
-use ratatui::{Terminal, Frame};
-use std::io::stdout;
+use crossterm::event;
+use rand::distr::{Distribution, Uniform};
+use ratatui::backend::Backend;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Gauge, LineGauge, List, ListItem, Paragraph, Widget};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport, symbols};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-    
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    
-    let result = App::new().run(&mut terminal);
-    
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-    
-    result
+    let mut terminal = ratatui::init_with_options(TerminalOptions {
+        viewport: Viewport::Inline(8),
+    });
+
+    let (tx, rx) = mpsc::channel();
+    input_handling(tx.clone());
+    let workers = workers(tx);
+    let mut downloads = downloads();
+
+    for w in &workers {
+        let d = downloads.next(w.id).unwrap();
+        w.tx.send(d).unwrap();
+    }
+
+    let app_result = run(&mut terminal, workers, downloads, rx);
+
+    ratatui::restore();
+
+    app_result
 }
 
-/// App holds the state of the application
-struct App {
-    /// Current value of the input box
-    input: String,
-    /// Position of cursor in the editor area.
-    character_index: usize,
-    /// Current input mode
-    input_mode: InputMode,
-    /// History of recorded messages
-    messages: Vec<String>,
+const NUM_DOWNLOADS: usize = 10;
+
+type DownloadId = usize;
+type WorkerId = usize;
+enum Event {
+    Input(event::KeyEvent),
+    Tick,
+    Resize,
+    DownloadUpdate(WorkerId, DownloadId, f64),
+    DownloadDone(WorkerId, DownloadId),
+}
+struct Downloads {
+    pending: VecDeque<Download>,
+    in_progress: BTreeMap<WorkerId, DownloadInProgress>,
 }
 
-enum InputMode {
-    Normal,
-    Editing,
-}
-
-impl App {
-    const fn new() -> Self {
-        Self {
-            input: String::new(),
-            input_mode: InputMode::Normal,
-            messages: Vec::new(),
-            character_index: 0,
+impl Downloads {
+    fn next(&mut self, worker_id: WorkerId) -> Option<Download> {
+        match self.pending.pop_front() {
+            Some(d) => {
+                self.in_progress.insert(
+                    worker_id,
+                    DownloadInProgress {
+                        id: d.id,
+                        started_at: Instant::now(),
+                        progress: 0.0,
+                    },
+                );
+                Some(d)
+            }
+            None => None,
         }
     }
+}
+struct DownloadInProgress {
+    id: DownloadId,
+    started_at: Instant,
+    progress: f64,
+}
+struct Download {
+    id: DownloadId,
+    size: usize,
+}
+struct Worker {
+    id: WorkerId,
+    tx: mpsc::Sender<Download>,
+}
 
-    fn move_cursor_left(&mut self) {
-        let cursor_moved_left = self.character_index.saturating_sub(1);
-        self.character_index = self.clamp_cursor(cursor_moved_left);
-    }
-
-    fn move_cursor_right(&mut self) {
-        let cursor_moved_right = self.character_index.saturating_add(1);
-        self.character_index = self.clamp_cursor(cursor_moved_right);
-    }
-
-    fn enter_char(&mut self, new_char: char) {
-        let index = self.byte_index();
-        self.input.insert(index, new_char);
-        self.move_cursor_right();
-    }
-
-    /// Returns the byte index based on the character position.
-    ///
-    /// Since each character in a string can contain multiple bytes, it's necessary to calculate
-    /// the byte index based on the index of the character.
-    fn byte_index(&self) -> usize {
-        self.input
-            .char_indices()
-            .map(|(i, _)| i)
-            .nth(self.character_index)
-            .unwrap_or(self.input.len())
-    }
-
-    fn delete_char(&mut self) {
-        let is_not_cursor_leftmost = self.character_index != 0;
-        if is_not_cursor_leftmost {
-            // Method "remove" is not used on the saved text for deleting the selected char.
-            // Reason: Using remove on String works on bytes instead of the chars.
-            // Using remove would require special care because of char boundaries.
-
-            let current_index = self.character_index;
-            let from_left_to_current_index = current_index - 1;
-
-            // Getting all characters before the selected character.
-            let before_char_to_delete = self.input.chars().take(from_left_to_current_index);
-            // Getting all characters after selected character.
-            let after_char_to_delete = self.input.chars().skip(current_index);
-
-            // Put all characters together except the selected one.
-            // By leaving the selected one out, it is forgotten and therefore deleted.
-            self.input = before_char_to_delete.chain(after_char_to_delete).collect();
-            self.move_cursor_left();
-        }
-    }
-
-    fn clamp_cursor(&self, new_cursor_pos: usize) -> usize {
-        new_cursor_pos.clamp(0, self.input.chars().count())
-    }
-
-    const fn reset_cursor(&mut self) {
-        self.character_index = 0;
-    }
-
-    fn submit_message(&mut self) {
-        self.messages.push(self.input.clone());
-        self.input.clear();
-        self.reset_cursor();
-    }
-
-    fn run(mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+fn input_handling(tx: mpsc::Sender<Event>) {
+    let tick_rate = Duration::from_millis(200);
+    thread::spawn(move || {
+        let mut last_tick = Instant::now();
         loop {
-            terminal.draw(|frame| self.render(frame))?;
+            // poll for tick rate duration, if no events, sent tick event.
+            let timeout = tick_rate.saturating_sub(last_tick.elapsed());
+            if event::poll(timeout).unwrap() {
+                match event::read().unwrap() {
+                    event::Event::Key(key) => tx.send(Event::Input(key)).unwrap(),
+                    event::Event::Resize(_, _) => tx.send(Event::Resize).unwrap(),
+                    _ => {}
+                }
+            }
+            if last_tick.elapsed() >= tick_rate {
+                tx.send(Event::Tick).unwrap();
+                last_tick = Instant::now();
+            }
+        }
+    });
+}
 
-            if let Some(key) = event::read()?.as_key_press_event() {
-                match self.input_mode {
-                    InputMode::Normal => match key.code {
-                        KeyCode::Char('e') => {
-                            self.input_mode = InputMode::Editing;
+#[expect(clippy::cast_precision_loss, clippy::needless_pass_by_value)]
+fn workers(tx: mpsc::Sender<Event>) -> Vec<Worker> {
+    (0..4)
+        .map(|id| {
+            let (worker_tx, worker_rx) = mpsc::channel::<Download>();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                while let Ok(download) = worker_rx.recv() {
+                    let mut remaining = download.size;
+                    while remaining > 0 {
+                        let wait = (remaining as u64).min(10);
+                        thread::sleep(Duration::from_millis(wait * 10));
+                        remaining = remaining.saturating_sub(10);
+                        let progress = (download.size - remaining) * 100 / download.size;
+                        tx.send(Event::DownloadUpdate(id, download.id, progress as f64))
+                            .unwrap();
+                    }
+                    tx.send(Event::DownloadDone(id, download.id)).unwrap();
+                }
+            });
+            Worker { id, tx: worker_tx }
+        })
+        .collect()
+}
+
+fn downloads() -> Downloads {
+    let distribution = Uniform::new(0, 1000).expect("invalid range");
+    let mut rng = rand::rng();
+    let pending = (0..NUM_DOWNLOADS)
+        .map(|id| {
+            let size = distribution.sample(&mut rng);
+            Download { id, size }
+        })
+        .collect();
+    Downloads {
+        pending,
+        in_progress: BTreeMap::new(),
+    }
+}
+
+#[expect(clippy::needless_pass_by_value)]
+fn run<B: Backend>(
+    terminal: &mut Terminal<B>,
+    workers: Vec<Worker>,
+    mut downloads: Downloads,
+    rx: mpsc::Receiver<Event>,
+) -> Result<()> {
+    let mut redraw = true;
+    loop {
+        if redraw {
+            terminal.draw(|frame| render(frame, &downloads))?;
+        }
+        redraw = true;
+
+        match rx.recv()? {
+            Event::Input(event) => {
+                if event.code == event::KeyCode::Char('q') {
+                    break;
+                }
+            }
+            Event::Resize => {
+                terminal.autoresize()?;
+            }
+            Event::Tick => {}
+            Event::DownloadUpdate(worker_id, _download_id, progress) => {
+                let download = downloads.in_progress.get_mut(&worker_id).unwrap();
+                download.progress = progress;
+                redraw = false;
+            }
+            Event::DownloadDone(worker_id, download_id) => {
+                let download = downloads.in_progress.remove(&worker_id).unwrap();
+                terminal.insert_before(1, |buf| {
+                    Paragraph::new(Line::from(vec![
+                        Span::from("Finished "),
+                        Span::styled(
+                            format!("download {download_id}"),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::from(format!(
+                            " in {}ms",
+                            download.started_at.elapsed().as_millis()
+                        )),
+                    ]))
+                    .render(buf.area, buf);
+                })?;
+                match downloads.next(worker_id) {
+                    Some(d) => workers[worker_id].tx.send(d).unwrap(),
+                    None => {
+                        if downloads.in_progress.is_empty() {
+                            terminal.insert_before(1, |buf| {
+                                Paragraph::new("Done !").render(buf.area, buf);
+                            })?;
+                            break;
                         }
-                        KeyCode::Char('q') => {
-                            return Ok(());
-                        }
-                        _ => {}
-                    },
-                    InputMode::Editing if key.kind == KeyEventKind::Press => match key.code {
-                        KeyCode::Enter => self.submit_message(),
-                        KeyCode::Char(to_insert) => self.enter_char(to_insert),
-                        KeyCode::Backspace => self.delete_char(),
-                        KeyCode::Left => self.move_cursor_left(),
-                        KeyCode::Right => self.move_cursor_right(),
-                        KeyCode::Esc => self.input_mode = InputMode::Normal,
-                        _ => {}
-                    },
-                    InputMode::Editing => {}
+                    }
                 }
             }
         }
     }
+    Ok(())
+}
 
-    fn render(&self, frame: &mut Frame) {
-        let layout = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Min(1),
-        ]);
-        let [help_area, input_area, messages_area] = layout.areas(frame.area());
+fn render(frame: &mut Frame, downloads: &Downloads) {
+    let area = frame.area();
 
-        let (msg, style) = match self.input_mode {
-            InputMode::Normal => (
-                vec![
-                    "Press ".into(),
-                    "q".bold(),
-                    " to exit, ".into(),
-                    "e".bold(),
-                    " to start editing.".bold(),
-                ],
-                Style::default().add_modifier(Modifier::RAPID_BLINK),
-            ),
-            InputMode::Editing => (
-                vec![
-                    "Press ".into(),
-                    "Esc".bold(),
-                    " to stop editing, ".into(),
-                    "Enter".bold(),
-                    " to record the message".into(),
-                ],
-                Style::default(),
-            ),
-        };
-        let text = Text::from(Line::from(msg)).patch_style(style);
-        let help_message = Paragraph::new(text);
-        frame.render_widget(help_message, help_area);
+    let block = Block::new().title(Line::from("Progress").centered());
+    frame.render_widget(block, area);
 
-        let input = Paragraph::new(self.input.as_str())
-            .style(match self.input_mode {
-                InputMode::Normal => Style::default(),
-                InputMode::Editing => Style::default().fg(Color::Yellow),
-            })
-            .block(Block::bordered().title("Input"));
-        frame.render_widget(input, input_area);
-        match self.input_mode {
-            // Hide the cursor. `Frame` does this by default, so we don't need to do anything here
-            InputMode::Normal => {}
+    let vertical = Layout::vertical([Constraint::Length(2), Constraint::Length(4)]).margin(1);
+    let horizontal = Layout::horizontal([Constraint::Percentage(20), Constraint::Percentage(80)]);
+    let areas = vertical.split(area);
+    let progress_area = areas[0];
+    let main = areas[1];
+    let main_areas = horizontal.split(main);
+    let list_area = main_areas[0];
+    let gauge_area = main_areas[1];
 
-            // Make the cursor visible and ask ratatui to put it at the specified coordinates after
-            // rendering
-            #[expect(clippy::cast_possible_truncation)]
-            InputMode::Editing => frame.set_cursor_position(Position::new(
-                // Draw the cursor at the current position in the input field.
-                // This position can be controlled via the left and right arrow key
-                input_area.x + self.character_index as u16 + 1,
-                // Move one line down, from the border to the input line
-                input_area.y + 1,
-            )),
+    // total progress
+    let done = NUM_DOWNLOADS - downloads.pending.len() - downloads.in_progress.len();
+    #[expect(clippy::cast_precision_loss)]
+    let progress = LineGauge::default()
+        .filled_style(Style::default().fg(Color::Blue))
+        .label(format!("{done}/{NUM_DOWNLOADS}"))
+        .ratio(done as f64 / NUM_DOWNLOADS as f64);
+    frame.render_widget(progress, progress_area);
+
+    // in progress downloads
+    let items: Vec<ListItem> = downloads
+        .in_progress
+        .values()
+        .map(|download| {
+            ListItem::new(Line::from(vec![
+                Span::raw(symbols::DOT),
+                Span::styled(
+                    format!(" download {:>2}", download.id),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    " ({}ms)",
+                    download.started_at.elapsed().as_millis()
+                )),
+            ]))
+        })
+        .collect();
+    let list = List::new(items);
+    frame.render_widget(list, list_area);
+
+    #[expect(clippy::cast_possible_truncation)]
+    for (i, (_, download)) in downloads.in_progress.iter().enumerate() {
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Yellow))
+            .ratio(download.progress / 100.0);
+        if gauge_area.top().saturating_add(i as u16) > area.bottom() {
+            continue;
         }
-
-        let messages: Vec<ListItem> = self
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let content = Line::from(Span::raw(format!("{i}: {m}")));
-                ListItem::new(content)
-            })
-            .collect();
-        let messages = List::new(messages).block(Block::bordered().title("Messages"));
-        frame.render_widget(messages, messages_area);
+        frame.render_widget(
+            gauge,
+            Rect {
+                x: gauge_area.left(),
+                y: gauge_area.top().saturating_add(i as u16),
+                width: gauge_area.width,
+                height: 1,
+            },
+        );
     }
 }
