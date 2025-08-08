@@ -1,12 +1,9 @@
-/// A Ratatui example that demonstrates how to use the inlined viewport.
+/// A Ratatui example that visualizes package installation progress.
 ///
-/// It shows a list of downloads in progress, with a progress bar for each download.
+/// It shows the status of installing packages with apt-get, displaying
+/// progress bars for each installation step.
 ///
-/// This example runs with the Ratatui library code in the branch that you are currently
-/// reading. See the [`latest`] branch for the code which works with the most recent Ratatui
-/// release.
-///
-/// [`latest`]: https://github.com/ratatui/ratatui/tree/latest
+/// Based on the Ratatui download progress example.
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::mpsc,
@@ -16,13 +13,12 @@ use std::{
 
 use color_eyre::Result;
 use crossterm::event;
-use rand::distr::{Distribution, Uniform};
 use ratatui::backend::Backend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Gauge, LineGauge, List, ListItem, Paragraph, Widget};
-use ratatui::{Frame, Terminal, TerminalOptions, Viewport, symbols};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 fn main() -> Result<()> {
     color_eyre::install()?;
@@ -33,66 +29,69 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel();
     input_handling(tx.clone());
     let workers = workers(tx);
-    let mut downloads = downloads();
+    let mut installations = packages();
 
     for w in &workers {
-        let d = downloads.next(w.id).unwrap();
-        w.tx.send(d).unwrap();
+        let p = installations.next(w.id).unwrap();
+        w.tx.send(p).unwrap();
     }
 
-    let app_result = run(&mut terminal, workers, downloads, rx);
+    let app_result = run(&mut terminal, workers, installations, rx);
 
     ratatui::restore();
 
     app_result
 }
 
-const NUM_DOWNLOADS: usize = 10;
+const NUM_PACKAGES: usize = 5;
 
-type DownloadId = usize;
+type PackageId = usize;
 type WorkerId = usize;
 enum Event {
     Input(event::KeyEvent),
     Tick,
     Resize,
-    DownloadUpdate(WorkerId, DownloadId, f64),
-    DownloadDone(WorkerId, DownloadId),
+    InstallUpdate(WorkerId, PackageId, f64),
+    InstallDone(WorkerId, PackageId),
 }
-struct Downloads {
-    pending: VecDeque<Download>,
-    in_progress: BTreeMap<WorkerId, DownloadInProgress>,
+struct Installations {
+    pending: VecDeque<Package>,
+    in_progress: BTreeMap<WorkerId, PackageInProgress>,
 }
 
-impl Downloads {
-    fn next(&mut self, worker_id: WorkerId) -> Option<Download> {
+impl Installations {
+    fn next(&mut self, worker_id: WorkerId) -> Option<Package> {
         match self.pending.pop_front() {
-            Some(d) => {
+            Some(p) => {
                 self.in_progress.insert(
                     worker_id,
-                    DownloadInProgress {
-                        id: d.id,
+                    PackageInProgress {
+                        id: p.id,
+                        name: p.name.clone(),
                         started_at: Instant::now(),
                         progress: 0.0,
                     },
                 );
-                Some(d)
+                Some(p)
             }
             None => None,
         }
     }
 }
-struct DownloadInProgress {
-    id: DownloadId,
+struct PackageInProgress {
+    id: PackageId,
+    name: String,
     started_at: Instant,
     progress: f64,
 }
-struct Download {
-    id: DownloadId,
+struct Package {
+    id: PackageId,
+    name: String,
     size: usize,
 }
 struct Worker {
     id: WorkerId,
-    tx: mpsc::Sender<Download>,
+    tx: mpsc::Sender<Package>,
 }
 
 fn input_handling(tx: mpsc::Sender<Event>) {
@@ -119,22 +118,22 @@ fn input_handling(tx: mpsc::Sender<Event>) {
 
 #[expect(clippy::cast_precision_loss, clippy::needless_pass_by_value)]
 fn workers(tx: mpsc::Sender<Event>) -> Vec<Worker> {
-    (0..4)
+    (0..2)
         .map(|id| {
-            let (worker_tx, worker_rx) = mpsc::channel::<Download>();
+            let (worker_tx, worker_rx) = mpsc::channel::<Package>();
             let tx = tx.clone();
             thread::spawn(move || {
-                while let Ok(download) = worker_rx.recv() {
-                    let mut remaining = download.size;
+                while let Ok(package) = worker_rx.recv() {
+                    let mut remaining = package.size;
                     while remaining > 0 {
                         let wait = (remaining as u64).min(10);
-                        thread::sleep(Duration::from_millis(wait * 10));
+                        thread::sleep(Duration::from_millis(wait * 15));
                         remaining = remaining.saturating_sub(10);
-                        let progress = (download.size - remaining) * 100 / download.size;
-                        tx.send(Event::DownloadUpdate(id, download.id, progress as f64))
+                        let progress = (package.size - remaining) * 100 / package.size;
+                        tx.send(Event::InstallUpdate(id, package.id, progress as f64))
                             .unwrap();
                     }
-                    tx.send(Event::DownloadDone(id, download.id)).unwrap();
+                    tx.send(Event::InstallDone(id, package.id)).unwrap();
                 }
             });
             Worker { id, tx: worker_tx }
@@ -142,16 +141,26 @@ fn workers(tx: mpsc::Sender<Event>) -> Vec<Worker> {
         .collect()
 }
 
-fn downloads() -> Downloads {
-    let distribution = Uniform::new(0, 1000).expect("invalid range");
-    let mut rng = rand::rng();
-    let pending = (0..NUM_DOWNLOADS)
-        .map(|id| {
-            let size = distribution.sample(&mut rng);
-            Download { id, size }
+fn packages() -> Installations {
+    let packages = vec![
+        ("git", 150),
+        ("git-man", 80),
+        ("liberror-perl", 40),
+        ("git-core", 100),
+        ("ca-certificates", 60),
+    ];
+    
+    let pending = packages
+        .into_iter()
+        .enumerate()
+        .map(|(id, (name, size))| Package {
+            id,
+            name: name.to_string(),
+            size,
         })
         .collect();
-    Downloads {
+    
+    Installations {
         pending,
         in_progress: BTreeMap::new(),
     }
@@ -161,13 +170,13 @@ fn downloads() -> Downloads {
 fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     workers: Vec<Worker>,
-    mut downloads: Downloads,
+    mut installations: Installations,
     rx: mpsc::Receiver<Event>,
 ) -> Result<()> {
     let mut redraw = true;
     loop {
         if redraw {
-            terminal.draw(|frame| render(frame, &downloads))?;
+            terminal.draw(|frame| render(frame, &installations))?;
         }
         redraw = true;
 
@@ -181,33 +190,37 @@ fn run<B: Backend>(
                 terminal.autoresize()?;
             }
             Event::Tick => {}
-            Event::DownloadUpdate(worker_id, _download_id, progress) => {
-                let download = downloads.in_progress.get_mut(&worker_id).unwrap();
-                download.progress = progress;
+            Event::InstallUpdate(worker_id, _package_id, progress) => {
+                let package = installations.in_progress.get_mut(&worker_id).unwrap();
+                package.progress = progress;
                 redraw = false;
             }
-            Event::DownloadDone(worker_id, download_id) => {
-                let download = downloads.in_progress.remove(&worker_id).unwrap();
+            Event::InstallDone(worker_id, _package_id) => {
+                let package = installations.in_progress.remove(&worker_id).unwrap();
                 terminal.insert_before(1, |buf| {
                     Paragraph::new(Line::from(vec![
-                        Span::from("Finished "),
+                        Span::from("✓ Installed "),
                         Span::styled(
-                            format!("download {download_id}"),
-                            Style::default().add_modifier(Modifier::BOLD),
+                            package.name.clone(),
+                            Style::default().add_modifier(Modifier::BOLD).fg(Color::Green),
                         ),
                         Span::from(format!(
                             " in {}ms",
-                            download.started_at.elapsed().as_millis()
+                            package.started_at.elapsed().as_millis()
                         )),
                     ]))
                     .render(buf.area, buf);
                 })?;
-                match downloads.next(worker_id) {
-                    Some(d) => workers[worker_id].tx.send(d).unwrap(),
+                match installations.next(worker_id) {
+                    Some(p) => workers[worker_id].tx.send(p).unwrap(),
                     None => {
-                        if downloads.in_progress.is_empty() {
+                        if installations.in_progress.is_empty() {
                             terminal.insert_before(1, |buf| {
-                                Paragraph::new("Done !").render(buf.area, buf);
+                                Paragraph::new(Line::from(vec![
+                                    Span::styled("🎉 ", Style::default().fg(Color::Yellow)),
+                                    Span::styled("Installation complete!", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                                    Span::from(" git is now available."),
+                                ])).render(buf.area, buf);
                             })?;
                             break;
                         }
@@ -219,14 +232,14 @@ fn run<B: Backend>(
     Ok(())
 }
 
-fn render(frame: &mut Frame, downloads: &Downloads) {
+fn render(frame: &mut Frame, installations: &Installations) {
     let area = frame.area();
 
-    let block = Block::new().title(Line::from("Progress").centered());
+    let block = Block::new().title(Line::from("📦 Package Installation Progress").centered());
     frame.render_widget(block, area);
 
     let vertical = Layout::vertical([Constraint::Length(2), Constraint::Length(4)]).margin(1);
-    let horizontal = Layout::horizontal([Constraint::Percentage(20), Constraint::Percentage(80)]);
+    let horizontal = Layout::horizontal([Constraint::Percentage(30), Constraint::Percentage(70)]);
     let areas = vertical.split(area);
     let progress_area = areas[0];
     let main = areas[1];
@@ -235,30 +248,30 @@ fn render(frame: &mut Frame, downloads: &Downloads) {
     let gauge_area = main_areas[1];
 
     // total progress
-    let done = NUM_DOWNLOADS - downloads.pending.len() - downloads.in_progress.len();
+    let done = NUM_PACKAGES - installations.pending.len() - installations.in_progress.len();
     #[expect(clippy::cast_precision_loss)]
     let progress = LineGauge::default()
-        .filled_style(Style::default().fg(Color::Blue))
-        .label(format!("{done}/{NUM_DOWNLOADS}"))
-        .ratio(done as f64 / NUM_DOWNLOADS as f64);
+        .filled_style(Style::default().fg(Color::Green))
+        .label(format!("Installing packages {done}/{NUM_PACKAGES}"))
+        .ratio(done as f64 / NUM_PACKAGES as f64);
     frame.render_widget(progress, progress_area);
 
-    // in progress downloads
-    let items: Vec<ListItem> = downloads
+    // in progress installations
+    let items: Vec<ListItem> = installations
         .in_progress
         .values()
-        .map(|download| {
+        .map(|package| {
             ListItem::new(Line::from(vec![
-                Span::raw(symbols::DOT),
+                Span::styled("📦 ", Style::default().fg(Color::Blue)),
                 Span::styled(
-                    format!(" download {:>2}", download.id),
+                    package.name.clone(),
                     Style::default()
-                        .fg(Color::LightGreen)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!(
                     " ({}ms)",
-                    download.started_at.elapsed().as_millis()
+                    package.started_at.elapsed().as_millis()
                 )),
             ]))
         })
@@ -267,10 +280,10 @@ fn render(frame: &mut Frame, downloads: &Downloads) {
     frame.render_widget(list, list_area);
 
     #[expect(clippy::cast_possible_truncation)]
-    for (i, (_, download)) in downloads.in_progress.iter().enumerate() {
+    for (i, (_, package)) in installations.in_progress.iter().enumerate() {
         let gauge = Gauge::default()
             .gauge_style(Style::default().fg(Color::Yellow))
-            .ratio(download.progress / 100.0);
+            .ratio(package.progress / 100.0);
         if gauge_area.top().saturating_add(i as u16) > area.bottom() {
             continue;
         }
